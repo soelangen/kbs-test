@@ -44,8 +44,10 @@ lazy_static!{
 async fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    let mut tmp = NV.write().unwrap();
-    tmp.push(args.tpm_path);
+    {
+        let mut tmp = NV.write().unwrap();
+        tmp.push(args.tpm_path);
+    }
 
     HttpServer::new(|| {
         App::new().service(
