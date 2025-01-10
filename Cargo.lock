@@ -952,6 +952,7 @@ dependencies = [
  "kbs-types",
  "lazy_static",
  "openssl",
+ "serde",
  "serde_json",
  "uuid",
 ]

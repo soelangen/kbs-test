@@ -4,13 +4,8 @@
 // Copyright (c) 2025 Sören Langenberg
 
 use std::{io, sync::RwLock, fs::read};
-
 use actix_web::{cookie::Cookie, post, web, App, HttpRequest, HttpResponse, HttpServer};
-use aes_gcm_siv::{
-    aead::{Aead, KeyInit, OsRng},
-    aead::rand_core::RngCore,
-    Aes256GcmSiv, Nonce
-};
+use aes_gcm_siv::{aead::{Aead, KeyInit, OsRng}, aead::rand_core::RngCore, Aes256GcmSiv, Nonce };
 
 use base64::prelude::*;
 use kbs_types::{Challenge, Request, Response, TeePubKey};
@@ -23,6 +18,7 @@ use openssl::{
 use serde_json::Value;
 use uuid::Uuid;
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 
 lazy_static! {
     pub static ref KEY: RwLock<Vec<Rsa<Public>>> = RwLock::new(Vec::new());
@@ -40,6 +36,21 @@ lazy_static!{
     pub static ref NV: RwLock<Vec<String>> = RwLock::new(Vec::new());
 }
 
+lazy_static!{
+    pub static ref AES_KEY: RwLock<Vec<Vec<u8>>> = RwLock::new(Vec::new());
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncRequest {
+    pub nonce: String,
+    pub secret: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub success: bool,
+}
+
 #[actix_web::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
@@ -54,6 +65,7 @@ async fn main() -> io::Result<()> {
             web::scope("/kbs/v0")
                 .service(auth)
                 .service(attest)
+                .service(syncback)
                 .service(resource),
         )
     })
@@ -128,6 +140,10 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>) -> Http
 
     // Aes initialization
     let aes_key = Aes256GcmSiv::generate_key(&mut OsRng);
+    {
+        let mut tmp = AES_KEY.write().unwrap();
+        tmp.push(Vec::from(aes_key.clone().as_slice()));
+    }
     let cipher = Aes256GcmSiv::new(&aes_key);
     let mut rand = [0u8; 12];
     OsRng.fill_bytes(&mut rand);
@@ -167,6 +183,35 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>) -> Http
         iv: nonce_encoded,
         ciphertext: encrypted_secret_encoded,
         tag: "".to_string(),
+    };
+
+    HttpResponse::Ok().json(resp)
+}
+
+#[post("/syncback")]
+pub async fn syncback(_req: HttpRequest, secret: web::Json<SyncRequest>) -> HttpResponse {
+    let request = secret.into_inner();
+
+    let key = {
+        let vec = AES_KEY.read().unwrap();
+        vec.last().unwrap().clone()
+    };
+
+    let iv = BASE64_STANDARD.decode(&request.nonce).unwrap();
+    let enc = BASE64_STANDARD.decode(&request.secret).unwrap();
+
+    let cipher = Aes256GcmSiv::new_from_slice(key.as_slice()).unwrap();
+    let nonce = Nonce::from_slice(iv.as_slice());
+
+    let decrypted = match cipher.decrypt(nonce, enc.as_slice()) {
+        Ok(value) => Ok(value),
+        Err(err) => Err(err)
+    };
+
+    println!("{:?}", decrypted);
+
+    let resp = SyncResponse {
+        success: true
     };
 
     HttpResponse::Ok().json(resp)
