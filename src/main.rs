@@ -3,7 +3,7 @@
 // Copyright (c) 2024 Tyler Fanelli
 // Copyright (c) 2025 Sören Langenberg
 
-use std::{io, sync::RwLock, fs::read};
+use std::{io, sync::RwLock, fs::read, fs::write};
 use actix_web::{cookie::Cookie, post, web, App, HttpRequest, HttpResponse, HttpServer};
 use aes_gcm_siv::{aead::{Aead, KeyInit, OsRng}, aead::rand_core::RngCore, Aes256GcmSiv, Nonce };
 
@@ -197,6 +197,11 @@ pub async fn syncback(_req: HttpRequest, secret: web::Json<SyncRequest>) -> Http
         vec.last().unwrap().clone()
     };
 
+    let path = {
+        let vec = NV.write().unwrap();
+        vec.last().unwrap().clone()
+    };
+
     let iv = BASE64_STANDARD.decode(&request.nonce).unwrap();
     let enc = BASE64_STANDARD.decode(&request.secret).unwrap();
 
@@ -208,7 +213,7 @@ pub async fn syncback(_req: HttpRequest, secret: web::Json<SyncRequest>) -> Http
         Err(err) => Err(err)
     };
 
-    println!("{:?}", decrypted);
+    write(path, decrypted.unwrap()).expect("Failed to write");
 
     let resp = SyncResponse {
         success: true
