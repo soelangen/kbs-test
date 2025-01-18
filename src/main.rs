@@ -1,33 +1,74 @@
 // SPDX-License-Identifier: Apache-2.0
+//
+// Copyright (c) 2024 Tyler Fanelli
+// Copyright (c) 2025 Sören Langenberg
 
-use std::{cmp::min, collections::BTreeMap, io, sync::RwLock};
+use std::{collections::BTreeMap, fs::read, fs::write, io, sync::RwLock};
 
 use actix_web::{cookie::Cookie, post, web, App, HttpRequest, HttpResponse, HttpServer};
-use aes::{
-    cipher::{BlockEncrypt, KeyInit},
-    Aes128,
+use aes_gcm_siv::{
+    aead::rand_core::RngCore,
+    aead::{Aead, KeyInit, OsRng},
+    Aes256GcmSiv, Nonce,
 };
 use base64::prelude::*;
 use elliptic_curve::JwkEcKey;
 use kbs_types::{Challenge, ProtectedHeader, Request, Response, TeePubKey};
 use lazy_static::lazy_static;
 use p384::{ecdh::EphemeralSecret, EncodedPoint, NistP384};
-use rand_core::OsRng;
 use serde_json::Value;
 use sha2::Sha256;
 use uuid::Uuid;
+
+use clap::Parser;
+use serde::{Deserialize, Serialize};
+
+#[derive(Parser, Debug)]
+#[clap(version, about, long_about = None)]
+struct Args {
+    // Local filesystem path to the NVChip of the generated TPM
+    #[clap(long = "path")]
+    tpm_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncRequest {
+    pub nonce: Vec<u8>,
+    pub secret: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub success: bool,
+}
 
 lazy_static! {
     pub static ref KEY: RwLock<Vec<(JwkEcKey, EphemeralSecret)>> = RwLock::new(Vec::new());
 }
 
+lazy_static! {
+    pub static ref NV: RwLock<Vec<String>> = RwLock::new(Vec::new());
+}
+
+lazy_static! {
+    pub static ref AES_MATERIAL: RwLock<Vec<Vec<u8>>> = RwLock::new(Vec::new());
+}
+
 #[actix_web::main]
 async fn main() -> io::Result<()> {
+    let args = Args::parse();
+
+    {
+        let mut tmp = NV.write().unwrap();
+        tmp.push(args.tpm_path);
+    }
+
     HttpServer::new(|| {
         App::new().service(
             web::scope("/kbs/v0")
                 .service(auth)
                 .service(attest)
+                .service(syncback)
                 .service(resource),
         )
     })
@@ -100,28 +141,32 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>) -> Http
     let shared = private.diffie_hellman(&public);
     let hkdf = shared.extract::<Sha256>(None);
 
-    let mut out = [0u8; 16];
+    let mut out = [0u8; 32];
     let empty: [u8; 0] = [];
 
     hkdf.expand(&empty, &mut out).unwrap();
-    let aes = Aes128::new_from_slice(&out).unwrap();
-
-    let plaintext = String::from("hello, SVSM! This message is from the attestation server");
-
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut ptr = 0;
-    let pt_bytes = plaintext.as_bytes();
-    let len = pt_bytes.len();
-
-    while ptr < len {
-        let mut enc = [0u8; 16];
-        let remain = min(16, len - ptr);
-        enc[..remain].copy_from_slice(&pt_bytes[ptr..ptr + remain]);
-
-        aes.encrypt_block((&mut enc).into());
-        bytes.append(&mut enc.to_vec());
-        ptr += 16;
+    {
+        let mut tmp = AES_MATERIAL.write().unwrap();
+        tmp.push(Vec::from(out.clone()));
     }
+
+    let aes = Aes256GcmSiv::new_from_slice(&out).unwrap();
+
+    let mut rand = [0u8; 12];
+    OsRng.fill_bytes(&mut rand);
+    let nonce = Nonce::from_slice(&rand);
+
+    let path = {
+        let vec = NV.write().unwrap();
+        vec.last().unwrap().clone()
+    };
+
+    let plaintext = read(path).expect("Nothing");
+
+    let encrypted_secret = match aes.encrypt(nonce, plaintext.as_ref()) {
+        Ok(value) => value,
+        Err(_err) => panic!("Encryption failed"),
+    };
 
     let protected = ProtectedHeader {
         alg: "ECDHP384".to_string(),
@@ -133,10 +178,39 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>) -> Http
         protected,
         encrypted_key: private.public_key().to_sec1_bytes().to_vec(),
         aad: None,
-        iv: "".to_string().into(),
-        ciphertext: bytes,
+        iv: nonce.to_vec(),
+        ciphertext: encrypted_secret,
         tag: "".to_string().into(),
     };
+
+    HttpResponse::Ok().json(resp)
+}
+
+#[post("/syncback")]
+pub async fn syncback(_req: HttpRequest, secret: web::Json<SyncRequest>) -> HttpResponse {
+    let request = secret.into_inner();
+
+    let material = {
+        let vec = AES_MATERIAL.read().unwrap();
+        vec.last().unwrap().clone()
+    };
+
+    let path = {
+        let vec = NV.write().unwrap();
+        vec.last().unwrap().clone()
+    };
+
+    let iv = request.nonce;
+    let enc = request.secret;
+
+    let aes = Aes256GcmSiv::new_from_slice(&material).unwrap();
+    let nonce = Nonce::from_slice(iv.as_slice());
+
+    let decrypted = aes.decrypt(nonce, enc.as_slice()).unwrap();
+
+    write(path, decrypted).expect("Failed to write");
+
+    let resp = SyncResponse { success: true };
 
     HttpResponse::Ok().json(resp)
 }
