@@ -4,11 +4,11 @@
 // Copyright (c) 2025 Sören Langenberg
 
 use std::{collections::BTreeMap, fs::read, fs::write, io, sync::RwLock};
-
+use std::collections::HashMap;
 use actix_web::{cookie::Cookie, post, web, App, HttpRequest, HttpResponse, HttpServer};
 use aes_gcm_siv::{
     aead::rand_core::RngCore,
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit, Payload, OsRng},
     Aes256GcmSiv, Nonce,
 };
 use base64::prelude::*;
@@ -17,6 +17,7 @@ use kbs_types::{Challenge, ProtectedHeader, Request, Response, TeePubKey};
 use lazy_static::lazy_static;
 use p384::{ecdh::EphemeralSecret, EncodedPoint, NistP384};
 use serde_json::Value;
+use sev::firmware::guest::AttestationReport;
 use sha2::Sha256;
 use uuid::Uuid;
 
@@ -35,11 +36,18 @@ struct Args {
 pub struct SyncRequest {
     pub nonce: Vec<u8>,
     pub secret: Vec<u8>,
+    pub family_id: [u8; 16],
+    pub image_id: [u8; 16],
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub success: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResourceRequest {
+    pub family_id: [u8; 16],
+    pub image_id: [u8; 16],
 }
 
 lazy_static! {
@@ -51,7 +59,7 @@ lazy_static! {
 }
 
 lazy_static! {
-    pub static ref AES_MATERIAL: RwLock<Vec<Vec<u8>>> = RwLock::new(Vec::new());
+    pub static ref AES_MATERIAL: RwLock<HashMap<Vec<u8>,Option<Vec<u8>>>> = RwLock::new(HashMap::new());
 }
 
 #[actix_web::main]
@@ -96,6 +104,21 @@ pub async fn attest(req: HttpRequest, attest: web::Json<kbs_types::Attestation>)
 
     let attest = attest.into_inner();
 
+    let report = attest.tee_evidence.as_str().unwrap();
+
+    // For now we assume that attestation is successful
+    let attestation_report = BASE64_URL_SAFE.decode(report).unwrap();
+    let attestation_report: AttestationReport = bincode::deserialize_from(attestation_report.as_slice()).unwrap();
+
+    {
+        let mut tmp = AES_MATERIAL.write().unwrap();
+        let mut id = [0u8; 32];
+        id[..16].copy_from_slice(&attestation_report.family_id);
+        id[16..].copy_from_slice(&attestation_report.image_id);
+
+        tmp.insert(Vec::from(id), None);
+    }
+
     let ec = match attest.tee_pubkey {
         TeePubKey::EC {
             crv: _,
@@ -126,11 +149,13 @@ pub async fn attest(req: HttpRequest, attest: web::Json<kbs_types::Attestation>)
 }
 
 #[post("/{resouce_id}")]
-pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>) -> HttpResponse {
+pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>, resource: web::Json<ResourceRequest>) -> HttpResponse {
     let id = resource_id.into_inner();
     if id != "svsm_secret" {
         panic!("invalid resource id");
     }
+
+    let vm_ids = resource.into_inner();
 
     let (jwk, private) = {
         let mut vec = KEY.write().unwrap();
@@ -147,7 +172,10 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>) -> Http
     hkdf.expand(&empty, &mut out).unwrap();
     {
         let mut tmp = AES_MATERIAL.write().unwrap();
-        tmp.push(Vec::from(out.clone()));
+        let mut id = [0u8; 32];
+        id[..16].copy_from_slice(&vm_ids.family_id);
+        id[16..].copy_from_slice(&vm_ids.image_id);
+        tmp.insert(Vec::from(id), Some(out.to_vec()));
     }
 
     let aes = Aes256GcmSiv::new_from_slice(&out).unwrap();
@@ -190,11 +218,6 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>) -> Http
 pub async fn syncback(_req: HttpRequest, secret: web::Json<SyncRequest>) -> HttpResponse {
     let request = secret.into_inner();
 
-    let material = {
-        let vec = AES_MATERIAL.read().unwrap();
-        vec.last().unwrap().clone()
-    };
-
     let path = {
         let vec = NV.write().unwrap();
         vec.last().unwrap().clone()
@@ -202,11 +225,24 @@ pub async fn syncback(_req: HttpRequest, secret: web::Json<SyncRequest>) -> Http
 
     let iv = request.nonce;
     let enc = request.secret;
+    let family_id = request.family_id;
+    let image_id = request.image_id;
 
-    let aes = Aes256GcmSiv::new_from_slice(&material).unwrap();
+    let mut aad = [0u8; 32];
+    aad[..16].copy_from_slice(&family_id);
+    aad[16..].copy_from_slice(&image_id);
+
+    let material = {
+        let tmp = AES_MATERIAL.read().unwrap();
+        tmp.get(&Vec::from(aad)).unwrap().clone()
+    };
+
+    let aes = Aes256GcmSiv::new_from_slice(material.as_ref().unwrap()).unwrap();
     let nonce = Nonce::from_slice(iv.as_slice());
 
-    let decrypted = aes.decrypt(nonce, enc.as_slice()).unwrap();
+    let payload = Payload{msg: enc.as_slice(), aad: &aad};
+
+    let decrypted = aes.decrypt(nonce, payload).unwrap();
 
     write(path, decrypted).expect("Failed to write");
 
