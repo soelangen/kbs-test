@@ -1118,6 +1118,7 @@ dependencies = [
  "bincode",
  "clap",
  "elliptic-curve",
+ "hmac",
  "kbs-types",
  "lazy_static",
  "p384",

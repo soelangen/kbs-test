@@ -3,12 +3,10 @@
 // Copyright (c) 2024 Tyler Fanelli
 // Copyright (c) 2025 Sören Langenberg
 
-use std::{collections::BTreeMap, fs::read, fs::write, io, sync::RwLock};
-use std::collections::HashMap;
 use actix_web::{cookie::Cookie, post, web, App, HttpRequest, HttpResponse, HttpServer};
 use aes_gcm_siv::{
     aead::rand_core::RngCore,
-    aead::{Aead, KeyInit, Payload, OsRng},
+    aead::{Aead, KeyInit, OsRng, Payload},
     Aes256GcmSiv, Nonce,
 };
 use base64::prelude::*;
@@ -18,11 +16,18 @@ use lazy_static::lazy_static;
 use p384::{ecdh::EphemeralSecret, EncodedPoint, NistP384};
 use serde_json::Value;
 use sev::firmware::guest::AttestationReport;
-use sha2::Sha256;
+use sha2::{OidSha256, OidSha512, Sha256, Sha256VarCore, Sha512VarCore};
+use std::collections::HashMap;
+use std::{collections::BTreeMap, fs::read, fs::write, io, sync::RwLock};
 use uuid::Uuid;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+
+use hmac::digest::consts::{B0, B1};
+use hmac::digest::core_api::{CoreWrapper, CtVariableCoreWrapper};
+use hmac::digest::typenum::{UInt, UTerm};
+use hmac::{HmacCore, Mac};
 
 #[derive(Parser, Debug)]
 #[clap(version, about, long_about = None)]
@@ -48,6 +53,19 @@ pub struct SyncResponse {
 pub struct ResourceRequest {
     pub family_id: [u8; 16],
     pub image_id: [u8; 16],
+    pub algorithm: ResourceRequestHMAC,
+    pub mac: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttestResponse {
+    pub pubkey: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ResourceRequestHMAC {
+    HmacSha256,
+    HmacSha512,
 }
 
 lazy_static! {
@@ -59,7 +77,8 @@ lazy_static! {
 }
 
 lazy_static! {
-    pub static ref AES_MATERIAL: RwLock<HashMap<Vec<u8>,Option<Vec<u8>>>> = RwLock::new(HashMap::new());
+    pub static ref AES_MATERIAL: RwLock<HashMap<Vec<u8>, Option<Vec<u8>>>> =
+        RwLock::new(HashMap::new());
 }
 
 #[actix_web::main]
@@ -108,7 +127,8 @@ pub async fn attest(req: HttpRequest, attest: web::Json<kbs_types::Attestation>)
 
     // For now we assume that attestation is successful
     let attestation_report = BASE64_URL_SAFE.decode(report).unwrap();
-    let attestation_report: AttestationReport = bincode::deserialize_from(attestation_report.as_slice()).unwrap();
+    let attestation_report: AttestationReport =
+        bincode::deserialize_from(attestation_report.as_slice()).unwrap();
 
     {
         let mut tmp = AES_MATERIAL.write().unwrap();
@@ -142,20 +162,28 @@ pub async fn attest(req: HttpRequest, attest: web::Json<kbs_types::Attestation>)
         _ => panic!("invalid RSA key"),
     };
 
+    let resp = AttestResponse {
+        pubkey: ec.1.public_key().to_sec1_bytes().to_vec(),
+    };
+
     let mut key = KEY.write().unwrap();
     key.push(ec);
 
-    HttpResponse::Ok().into()
+    HttpResponse::Ok().json(resp)
 }
 
 #[post("/{resouce_id}")]
-pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>, resource: web::Json<ResourceRequest>) -> HttpResponse {
+pub async fn resource(
+    _req: HttpRequest,
+    resource_id: web::Path<String>,
+    resource: web::Json<ResourceRequest>,
+) -> HttpResponse {
     let id = resource_id.into_inner();
     if id != "svsm_secret" {
         panic!("invalid resource id");
     }
 
-    let vm_ids = resource.into_inner();
+    let res_request = resource.into_inner();
 
     let (jwk, private) = {
         let mut vec = KEY.write().unwrap();
@@ -169,13 +197,55 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>, resourc
     let mut out = [0u8; 32];
     let empty: [u8; 0] = [];
 
+    let mut id = [0u8; 32];
+    id[..16].copy_from_slice(&res_request.family_id);
+    id[16..].copy_from_slice(&res_request.image_id);
+
     hkdf.expand(&empty, &mut out).unwrap();
     {
         let mut tmp = AES_MATERIAL.write().unwrap();
-        let mut id = [0u8; 32];
-        id[..16].copy_from_slice(&vm_ids.family_id);
-        id[16..].copy_from_slice(&vm_ids.image_id);
         tmp.insert(Vec::from(id), Some(out.to_vec()));
+    }
+
+    // The following use of HMAC conflicts with KeyInit therefore using fully qualified name
+    match res_request.algorithm {
+        ResourceRequestHMAC::HmacSha256 => {
+            let mut hmac = <CoreWrapper<
+                HmacCore<
+                    CoreWrapper<
+                        CtVariableCoreWrapper<
+                            Sha256VarCore,
+                            UInt<UInt<UInt<UInt<UInt<UInt<UTerm, B1>, B0>, B0>, B0>, B0>, B0>,
+                            OidSha256,
+                        >,
+                    >,
+                >,
+            > as Mac>::new_from_slice(&out)
+            .expect("HMAC is able to accept all key sizes");
+            hmac.update(&id);
+            hmac.verify_slice(&res_request.mac)
+                .expect("MACs should match");
+        }
+        ResourceRequestHMAC::HmacSha512 => {
+            let mut hmac = <CoreWrapper<
+                HmacCore<
+                    CoreWrapper<
+                        CtVariableCoreWrapper<
+                            Sha512VarCore,
+                            UInt<
+                                UInt<UInt<UInt<UInt<UInt<UInt<UTerm, B1>, B0>, B0>, B0>, B0>, B0>,
+                                B0,
+                            >,
+                            OidSha512,
+                        >,
+                    >,
+                >,
+            > as Mac>::new_from_slice(&out)
+            .expect("HMAC is able to accept all key sizes");
+            hmac.update(&id);
+            hmac.verify_slice(&res_request.mac)
+                .expect("MACs should match");
+        }
     }
 
     let aes = Aes256GcmSiv::new_from_slice(&out).unwrap();
@@ -198,6 +268,7 @@ pub async fn resource(_req: HttpRequest, resource_id: web::Path<String>, resourc
 
     let protected = ProtectedHeader {
         alg: "ECDHP384".to_string(),
+        // TODO change toe AES256-GCM-SIV
         enc: "AES128".to_string(),
         other_fields: BTreeMap::new(),
     };
@@ -240,7 +311,10 @@ pub async fn syncback(_req: HttpRequest, secret: web::Json<SyncRequest>) -> Http
     let aes = Aes256GcmSiv::new_from_slice(material.as_ref().unwrap()).unwrap();
     let nonce = Nonce::from_slice(iv.as_slice());
 
-    let payload = Payload{msg: enc.as_slice(), aad: &aad};
+    let payload = Payload {
+        msg: enc.as_slice(),
+        aad: &aad,
+    };
 
     let decrypted = aes.decrypt(nonce, payload).unwrap();
 
